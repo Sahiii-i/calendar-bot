@@ -1,0 +1,21 @@
+{
+  "name": "calendar-bot",
+  "version": "1.0.0",
+  "description": "Telegram assistant that syncs Google Calendar + Gmail with daily digests",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "get-token": "node scripts/get-google-token.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.112.1",
+    "dotenv": "^16.4.5",
+    "googleapis": "^173.0.0",
+    "grammy": "^1.30.0",
+    "node-cron": "^3.0.3"
+  }
+}
