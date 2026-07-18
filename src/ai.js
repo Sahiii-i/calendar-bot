@@ -10,18 +10,23 @@ const MESSAGE_SCHEMA = {
   properties: {
     intent: {
       type: "string",
-      enum: ["create_event", "query_schedule", "other"],
-      description: "create_event: user wants something added to the calendar. query_schedule: user asks what is on their calendar. other: anything else.",
+      enum: ["create_event", "query_schedule", "update_event", "delete_event", "other"],
+      description: "create_event: user wants something added to the calendar. query_schedule: user asks what is on their calendar. update_event: user wants an existing event changed (moved, renamed, relocated). delete_event: user wants an existing event removed/cancelled. other: anything else.",
     },
     title: { type: "string", description: "Short event title, e.g. 'Zoom with Benson'. Empty unless create_event." },
     start: { type: "string", description: "Event start as ISO 8601 with +08:00 offset, e.g. 2026-07-18T15:00:00+08:00. Date-only YYYY-MM-DD for all-day events. Empty unless create_event." },
     end: { type: "string", description: "Event end, same format as start. If the user gave no duration, use start + 1 hour. Empty unless create_event or all-day." },
     location: { type: "string", description: "Location or meeting link if given, else empty." },
-    query_start: { type: "string", description: "For query_schedule: ISO 8601 start of the range asked about. Else empty." },
-    query_end: { type: "string", description: "For query_schedule: ISO 8601 end (exclusive) of the range. Else empty." },
+    query_start: { type: "string", description: "For query_schedule: ISO 8601 start of the range asked about. For update_event/delete_event: start of the range where the target event currently sits, if the user indicates it (e.g. 'Friday's meeting'). Empty if the user only gives the new time or gives no clue." },
+    query_end: { type: "string", description: "ISO 8601 end (exclusive) of that range. Else empty." },
+    target: { type: "string", description: "For update_event/delete_event: the words identifying which existing event, e.g. 'zoom with uncle nizar'. Empty if the user just says 'it' / 'that meeting' without naming it." },
+    new_title: { type: "string", description: "For update_event: the new title, only if the user wants it renamed. Else empty." },
+    new_start: { type: "string", description: "For update_event: new start as ISO 8601 with +08:00 offset, only if the time is changing. Else empty." },
+    new_end: { type: "string", description: "For update_event: new end, only if the user states a new end or duration. Empty means keep the event's current duration." },
+    new_location: { type: "string", description: "For update_event: new location, only if changing. Else empty." },
     reply: { type: "string", description: "For intent 'other': one short friendly sentence telling the user what this bot can do. Else empty." },
   },
-  required: ["intent", "title", "start", "end", "location", "query_start", "query_end", "reply"],
+  required: ["intent", "title", "start", "end", "location", "query_start", "query_end", "target", "new_title", "new_start", "new_end", "new_location", "reply"],
   additionalProperties: false,
 };
 
@@ -63,6 +68,8 @@ export async function interpretMessage(text) {
     `Current date and time: ${nowLocalISO()} (${config.timezone}).`,
     "Resolve relative dates ('tomorrow', 'next Tuesday', 'later at 3') against that current time.",
     "Times the user gives are in that timezone. Never invent details the user did not state.",
+    "'Change/move/reschedule/push X to ...' is update_event; 'cancel/delete/remove X' is delete_event.",
+    "For updates like 'change it to 12.30pm tomorrow', the new time goes in new_start; leave query_start empty unless the user says when the event currently is.",
   ].join(" ");
   return structured(system, text, MESSAGE_SCHEMA);
 }

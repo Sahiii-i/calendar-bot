@@ -40,6 +40,30 @@ export async function createEvent(event) {
   return res.data;
 }
 
+// changes: { title?, start?, end?, location? } — only the fields being changed.
+export async function patchEvent(eventId, changes) {
+  const requestBody = {};
+  if (changes.title) requestBody.summary = changes.title;
+  if (changes.location) requestBody.location = changes.location;
+  if (changes.start) {
+    const allDay = /^\d{4}-\d{2}-\d{2}$/.test(changes.start);
+    requestBody.start = allDay
+      ? { date: changes.start, dateTime: null }
+      : { dateTime: changes.start, timeZone: config.timezone, date: null };
+    requestBody.end = allDay
+      ? { date: nextDay(changes.start), dateTime: null }
+      : { dateTime: changes.end || plusOneHour(changes.start), timeZone: config.timezone, date: null };
+  } else if (changes.end) {
+    requestBody.end = { dateTime: changes.end, timeZone: config.timezone, date: null };
+  }
+  const res = await calendar.events.patch({ calendarId: "primary", eventId, requestBody });
+  return res.data;
+}
+
+export async function deleteEvent(eventId) {
+  await calendar.events.delete({ calendarId: "primary", eventId });
+}
+
 function nextDay(dateStr) {
   const d = new Date(`${dateStr}T00:00:00Z`);
   d.setUTCDate(d.getUTCDate() + 1);

@@ -2,19 +2,20 @@ import { Bot, InlineKeyboard } from "grammy";
 import cron from "node-cron";
 import { config } from "./config.js";
 import { interpretMessage, extractEventFromEmail } from "./ai.js";
-import { listEvents, createEvent, listUnprocessedEmails, getEmail, markEmailProcessed } from "./google.js";
-import { dayRange, fmtDate, fmtTime, fmtDateTime } from "./time.js";
+import { listEvents, createEvent, patchEvent, deleteEvent, listUnprocessedEmails, getEmail, markEmailProcessed } from "./google.js";
+import { dayRange, dayStart, fmtDate, fmtTime, fmtDateTime } from "./time.js";
 
 const bot = new Bot(config.telegramToken);
 
-// Pending confirmations (proposed events waiting for a button tap).
+// Pending confirmations (proposed actions waiting for a button tap).
+// Entries: { kind: "create", event } | { kind: "update", eventId, changes, body } | { kind: "delete", eventId, body }
 // In-memory: if the bot restarts, tapping an old button asks you to resend.
 const pending = new Map();
 let pendingSeq = 0;
 
-function stashEvent(event) {
+function stash(entry) {
   const id = String(++pendingSeq);
-  pending.set(id, event);
+  pending.set(id, entry);
   // Don't let the map grow forever.
   if (pending.size > 200) pending.delete(pending.keys().next().value);
   return id;
@@ -55,6 +56,65 @@ function describeProposal(event) {
   return `📌 ${event.title}\n🕐 ${when}${loc}`;
 }
 
+// When/where line for an existing Google Calendar event.
+function eventWhen(e) {
+  if (e.start?.date) return `${fmtDate(new Date(`${e.start.date}T00:00:00+08:00`))} (all day)`;
+  return `${fmtDateTime(new Date(e.start.dateTime))}–${fmtTime(new Date(e.end.dateTime))}`;
+}
+
+// How many words of the user's target phrase appear in the event title.
+function matchScore(target, summary) {
+  const words = target.toLowerCase().split(/\W+/).filter((w) => w.length > 2);
+  const s = (summary ?? "").toLowerCase();
+  return words.filter((w) => s.includes(w)).length;
+}
+
+// Fields to change on an existing event, from the parsed message.
+// If only a new start is given, the event keeps its current duration.
+function buildChanges(parsed, ev) {
+  const changes = {};
+  if (parsed.new_title) changes.title = parsed.new_title;
+  if (parsed.new_location) changes.location = parsed.new_location;
+  if (parsed.new_start) {
+    changes.start = parsed.new_start;
+    if (parsed.new_end) {
+      changes.end = parsed.new_end;
+    } else if (ev.start?.dateTime && ev.end?.dateTime && !/^\d{4}-\d{2}-\d{2}$/.test(parsed.new_start)) {
+      const duration = new Date(ev.end.dateTime) - new Date(ev.start.dateTime);
+      changes.end = new Date(new Date(parsed.new_start).getTime() + duration).toISOString();
+    }
+  } else if (parsed.new_end) {
+    changes.end = parsed.new_end;
+  }
+  return changes;
+}
+
+function describeChanges(ev, changes) {
+  const after = [];
+  if (changes.title) after.push(`📌 ${changes.title}`);
+  if (changes.start) {
+    const allDay = /^\d{4}-\d{2}-\d{2}$/.test(changes.start);
+    after.push(`🕐 ${allDay
+      ? `${fmtDate(new Date(`${changes.start}T00:00:00+08:00`))} (all day)`
+      : `${fmtDateTime(new Date(changes.start))}${changes.end ? `–${fmtTime(new Date(changes.end))}` : ""}`}`);
+  } else if (changes.end) {
+    after.push(`🕐 ends ${fmtTime(new Date(changes.end))}`);
+  }
+  if (changes.location) after.push(`📍 ${changes.location}`);
+  return `📌 ${ev.summary ?? "(no title)"}\n🕐 ${eventWhen(ev)}\n\n⬇️ becomes\n\n${after.join("\n")}`;
+}
+
+function actionPrompt(entry) {
+  if (entry.kind === "create") return `Add this?\n\n${describeProposal(entry.event)}`;
+  if (entry.kind === "delete") return `Delete this? 🗑\n\n${entry.body}`;
+  return `Update this?\n\n${entry.body}`;
+}
+
+function confirmKeyboard(id, entry) {
+  const yes = { create: "✅ Add", update: "✅ Update", delete: "🗑 Delete" }[entry.kind];
+  return new InlineKeyboard().text(yes, `confirm:${id}`).text("❌ Cancel", `cancel:${id}`);
+}
+
 function isAuthorized(ctx) {
   if (!config.telegramChatId) return true; // first-run mode, so /start can reveal the id
   return String(ctx.chat?.id) === String(config.telegramChatId);
@@ -68,6 +128,7 @@ bot.command("start", async (ctx) => {
       "Hey! I'm your calendar assistant. 🗓",
       "",
       "• Type things like \"Zoom with Benson tomorrow 3pm to 4pm\" and I'll add them to Google Calendar (I'll confirm first).",
+      "• Move or cancel things too: \"push tomorrow's Zoom to 12.30pm\", \"cancel Friday's dentist\".",
       "• Ask \"what's on this Friday?\" to check your schedule.",
       "• /today and /tomorrow for quick views, /week for the next 7 days.",
       `• Every night at ${String(config.digestHour).padStart(2, "0")}:${String(config.digestMinute).padStart(2, "0")} I send tomorrow's schedule.`,
@@ -113,11 +174,9 @@ bot.on("message:text", async (ctx) => {
         end: parsed.end || "",
         location: parsed.location || "",
       };
-      const id = stashEvent(event);
-      const keyboard = new InlineKeyboard()
-        .text("✅ Add", `confirm:${id}`)
-        .text("❌ Cancel", `cancel:${id}`);
-      await ctx.reply(`Add this?\n\n${describeProposal(event)}`, { reply_markup: keyboard });
+      const entry = { kind: "create", event };
+      const id = stash(entry);
+      await ctx.reply(actionPrompt(entry), { reply_markup: confirmKeyboard(id, entry) });
       return;
     }
 
@@ -128,9 +187,58 @@ bot.on("message:text", async (ctx) => {
       return;
     }
 
+    if (parsed.intent === "update_event" || parsed.intent === "delete_event") {
+      const isUpdate = parsed.intent === "update_event";
+      if (isUpdate && !parsed.new_start && !parsed.new_end && !parsed.new_title && !parsed.new_location) {
+        await ctx.reply("What should it change to? Give me the new time (or title/location).");
+        return;
+      }
+
+      // Search window: what the user indicated, else the next 14 days.
+      const winStart = parsed.query_start ? new Date(parsed.query_start) : dayStart(0);
+      const winEnd = parsed.query_end
+        ? new Date(parsed.query_end)
+        : new Date(winStart.getTime() + 14 * 24 * 3600 * 1000);
+      let candidates = await listEvents(winStart, winEnd);
+
+      // Narrow by title words if the user named the event.
+      if (parsed.target && candidates.length > 1) {
+        const scored = candidates.map((e) => [matchScore(parsed.target, e.summary), e]);
+        const best = Math.max(...scored.map(([s]) => s));
+        if (best > 0) candidates = scored.filter(([s]) => s === best).map(([, e]) => e);
+      }
+
+      if (candidates.length === 0) {
+        await ctx.reply("I couldn't find that event. Tell me its name and which day it's on.");
+        return;
+      }
+
+      const toEntry = (ev) => {
+        if (!isUpdate) return { kind: "delete", eventId: ev.id, body: `📌 ${ev.summary ?? "(no title)"}\n🕐 ${eventWhen(ev)}` };
+        const changes = buildChanges(parsed, ev);
+        return { kind: "update", eventId: ev.id, changes, body: describeChanges(ev, changes) };
+      };
+
+      if (candidates.length === 1) {
+        const entry = toEntry(candidates[0]);
+        const id = stash(entry);
+        await ctx.reply(actionPrompt(entry), { reply_markup: confirmKeyboard(id, entry) });
+        return;
+      }
+
+      // Ambiguous: let the user pick which event they meant.
+      const keyboard = new InlineKeyboard();
+      for (const ev of candidates.slice(0, 5)) {
+        const id = stash(toEntry(ev));
+        keyboard.text(`${fmtDate(new Date(ev.start.dateTime ?? `${ev.start.date}T00:00:00+08:00`))} ${ev.start.dateTime ? fmtTime(new Date(ev.start.dateTime)) : ""} ${ev.summary ?? ""}`.slice(0, 60), `pick:${id}`).row();
+      }
+      await ctx.reply(`Which one${isUpdate ? " should I change" : " should I delete"}?`, { reply_markup: keyboard });
+      return;
+    }
+
     await ctx.reply(
       parsed.reply ||
-        "I can add events (\"meeting with Kevin Friday 2pm\") or check your schedule (\"what's on tomorrow?\").",
+        "I can add events (\"meeting with Kevin Friday 2pm\"), move or cancel them (\"push my 3pm to 5pm\"), or check your schedule (\"what's on tomorrow?\").",
     );
   } catch (err) {
     console.error("message handling failed:", err);
@@ -140,11 +248,25 @@ bot.on("message:text", async (ctx) => {
 
 // ---------- Confirmation buttons ----------
 
+// Ambiguity picker: user tapped which event they meant — show its confirm prompt.
+bot.callbackQuery(/^pick:(.+)$/, async (ctx) => {
+  if (!isAuthorized(ctx)) return;
+  const id = ctx.match[1];
+  const entry = pending.get(id);
+  if (!entry) {
+    await ctx.answerCallbackQuery({ text: "This one expired. Send it again." });
+    await ctx.editMessageReplyMarkup();
+    return;
+  }
+  await ctx.answerCallbackQuery();
+  await ctx.editMessageText(actionPrompt(entry), { reply_markup: confirmKeyboard(id, entry) });
+});
+
 bot.callbackQuery(/^(confirm|cancel):(.+)$/, async (ctx) => {
   if (!isAuthorized(ctx)) return;
   const [, action, id] = ctx.match;
-  const event = pending.get(id);
-  if (!event) {
+  const entry = pending.get(id);
+  if (!entry) {
     await ctx.answerCallbackQuery({ text: "This one expired. Send it again." });
     await ctx.editMessageReplyMarkup();
     return;
@@ -153,18 +275,28 @@ bot.callbackQuery(/^(confirm|cancel):(.+)$/, async (ctx) => {
 
   if (action === "cancel") {
     await ctx.answerCallbackQuery({ text: "Cancelled" });
-    await ctx.editMessageText("❌ Cancelled, nothing added.");
+    await ctx.editMessageText("❌ Cancelled, nothing changed.");
     return;
   }
 
   try {
-    const created = await createEvent(event);
-    await ctx.answerCallbackQuery({ text: "Added!" });
-    await ctx.editMessageText(`✅ Added to calendar\n\n${describeProposal(event)}\n\n${created.htmlLink ?? ""}`);
+    if (entry.kind === "create") {
+      const created = await createEvent(entry.event);
+      await ctx.answerCallbackQuery({ text: "Added!" });
+      await ctx.editMessageText(`✅ Added to calendar\n\n${describeProposal(entry.event)}\n\n${created.htmlLink ?? ""}`);
+    } else if (entry.kind === "update") {
+      await patchEvent(entry.eventId, entry.changes);
+      await ctx.answerCallbackQuery({ text: "Updated!" });
+      await ctx.editMessageText(`✅ Updated\n\n${entry.body}`);
+    } else {
+      await deleteEvent(entry.eventId);
+      await ctx.answerCallbackQuery({ text: "Deleted" });
+      await ctx.editMessageText(`🗑 Deleted\n\n${entry.body}`);
+    }
   } catch (err) {
-    console.error("createEvent failed:", err);
+    console.error(`${entry.kind} failed:`, err);
     await ctx.answerCallbackQuery({ text: "Failed" });
-    await ctx.editMessageText("⚠️ Couldn't add that to Google Calendar. Check the server logs.");
+    await ctx.editMessageText("⚠️ Google Calendar said no. Check the server logs.");
   }
 });
 
@@ -206,7 +338,7 @@ async function scanEmails() {
             location: result.location || "",
             description: `From email: ${email.subject} (${email.from})`,
           };
-          const pid = stashEvent(event);
+          const pid = stash({ kind: "create", event });
           const keyboard = new InlineKeyboard()
             .text("✅ Add", `confirm:${pid}`)
             .text("❌ Ignore", `cancel:${pid}`);
