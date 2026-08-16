@@ -21,6 +21,53 @@ function stash(entry) {
   return id;
 }
 
+// ---------- Duplicate detection (email proposals) ----------
+
+// Email proposals Sahi tapped "Ignore" on, so reminder emails about the same
+// event don't keep re-asking. In-memory: resets on redeploy, but the calendar
+// check below covers anything that was actually added.
+const dismissed = [];
+
+function titleWords(s) {
+  return new Set((s ?? "").toLowerCase().split(/\W+/).filter((w) => w.length > 2));
+}
+
+// True when the shorter title's significant words mostly appear in the other,
+// e.g. "TWW 2026 starts soon!" matches "Tembusu Welcome Week (TWW) 2026".
+function similarTitles(a, b) {
+  const wa = titleWords(a);
+  const wb = titleWords(b);
+  if (wa.size === 0 || wb.size === 0) return false;
+  let shared = 0;
+  for (const w of wa) if (wb.has(w)) shared++;
+  return shared / Math.min(wa.size, wb.size) >= 0.6;
+}
+
+// Same event = similar title and starts within a few days. The date window
+// keeps weekly recurring things ("CS1010 lecture") on different weeks distinct.
+function sameEvent(titleA, startA, titleB, startB) {
+  if (!similarTitles(titleA, titleB)) return false;
+  const a = new Date(`${startA.slice(0, 10)}T00:00:00+08:00`);
+  const b = new Date(`${startB.slice(0, 10)}T00:00:00+08:00`);
+  return Math.abs(a - b) <= 3 * 24 * 3600 * 1000;
+}
+
+// A similar event already on the calendar around that date, or null.
+async function findOnCalendar(event) {
+  const dayMs = 24 * 3600 * 1000;
+  const day = new Date(`${event.start.slice(0, 10)}T00:00:00+08:00`);
+  const existing = await listEvents(new Date(day.getTime() - 3 * dayMs), new Date(day.getTime() + 4 * dayMs));
+  return existing.find((e) => similarTitles(event.title, e.summary)) ?? null;
+}
+
+// Already waiting on a tap for this event, or previously ignored?
+function alreadyAsked(event) {
+  for (const entry of pending.values()) {
+    if (entry.kind === "create" && entry.source === "email" && sameEvent(event.title, event.start, entry.event.title, entry.event.start)) return true;
+  }
+  return dismissed.some((d) => sameEvent(event.title, event.start, d.title, d.start));
+}
+
 // ---------- Helpers ----------
 
 function eventLine(e) {
@@ -274,6 +321,13 @@ bot.callbackQuery(/^(confirm|cancel):(.+)$/, async (ctx) => {
   pending.delete(id);
 
   if (action === "cancel") {
+    if (entry.kind === "create" && entry.source === "email") {
+      dismissed.push({ title: entry.event.title, start: entry.event.start });
+      if (dismissed.length > 100) dismissed.shift();
+      await ctx.answerCallbackQuery({ text: "Ignored" });
+      await ctx.editMessageText("❌ Ignored. I won't ask about this event again.");
+      return;
+    }
     await ctx.answerCallbackQuery({ text: "Cancelled" });
     await ctx.editMessageText("❌ Cancelled, nothing changed.");
     return;
@@ -281,6 +335,15 @@ bot.callbackQuery(/^(confirm|cancel):(.+)$/, async (ctx) => {
 
   try {
     if (entry.kind === "create") {
+      // Email proposals: a twin prompt may have been approved before this one.
+      if (entry.source === "email") {
+        const existing = await findOnCalendar(entry.event);
+        if (existing) {
+          await ctx.answerCallbackQuery({ text: "Already there" });
+          await ctx.editMessageText(`✅ Already on your calendar\n\n📌 ${existing.summary ?? "(no title)"}\n🕐 ${eventWhen(existing)}`);
+          return;
+        }
+      }
       const created = await createEvent(entry.event);
       await ctx.answerCallbackQuery({ text: "Added!" });
       await ctx.editMessageText(`✅ Added to calendar\n\n${describeProposal(entry.event)}\n\n${created.htmlLink ?? ""}`);
@@ -338,7 +401,14 @@ async function scanEmails() {
             location: result.location || "",
             description: `From email: ${email.subject} (${email.from})`,
           };
-          const pid = stash({ kind: "create", event });
+          // Reminder emails repeat events that are already handled: skip
+          // anything already on the calendar, already awaiting a tap, or
+          // already ignored.
+          if ((await findOnCalendar(event)) || alreadyAsked(event)) {
+            console.log(`skipping duplicate email event: "${event.title}" (${email.subject})`);
+            continue;
+          }
+          const pid = stash({ kind: "create", event, source: "email" });
           const keyboard = new InlineKeyboard()
             .text("✅ Add", `confirm:${pid}`)
             .text("❌ Ignore", `cancel:${pid}`);
