@@ -5,7 +5,10 @@ Personal Telegram assistant that:
 - Adds events to **Google Calendar** from plain text ("Zoom with Benson tomorrow 3pm")
 - Answers schedule questions ("what's on this Friday?"), plus `/today`, `/tomorrow`, `/week`
 - Sends a **nightly digest at 9pm** with tomorrow's schedule
-- Watches **Gmail** every 10 minutes for interview/meeting emails and asks (with tap buttons) whether to add them
+- Watches **Gmail** (Primary and Updates tabs) every 10 minutes for appointments **and deadlines** (fees, submissions, applications) and asks before adding them. Each card quotes the sentence the date came from, and the date/time is checked against that quote in code
+- Colour-codes everything into its own Google calendar: 🔵 School, 🟢 Work, 🟡 Personal, 🔴 Deadlines (deadlines get phone reminders 3 days and 1 day before)
+- **Not needed** on an email card means it never asks about that item again (remembered on disk, survives redeploys when `DATA_DIR` is a Railway volume)
+- 9pm briefing: what happened in your inbox today (School / Work / Personal / Money), then tomorrow's schedule. `/briefing` any time
 
 Everything the bot proposes needs one tap to confirm before it touches your calendar.
 
@@ -70,7 +73,7 @@ Done. Stop the local copy once Railway is up (two copies polling Telegram at onc
 | `Meeting with Kevin Fri 2pm to 3pm at Apex office` | Proposes the event, one tap to add |
 | `what do I have tomorrow?` | Lists tomorrow's events |
 | `/today` `/tomorrow` `/week` | Quick schedule views |
-| (nothing) 9pm daily | Digest of tomorrow's schedule |
+| (nothing) 9pm daily | Inbox recap for today + tomorrow's schedule |
 | (nothing) every 10 min | Scans new Gmail; proposes any appointment it finds |
 
 Emails the bot has looked at get a hidden `CalBot` label in Gmail so they're never scanned twice.
@@ -78,6 +81,9 @@ Emails the bot has looked at get a hidden `CalBot` label in Gmail so they're nev
 ## Config knobs (env vars)
 
 - `DIGEST_HOUR` / `DIGEST_MINUTE` — digest time (default 21:00)
+- `DATA_DIR` — where dismissals are saved (default `./data`; on Railway, a volume mounted at `/data`)
+
+Tests: `npm test` (date and time checks).
 - `EMAIL_POLL_MINUTES` — Gmail scan interval (default 10)
 - `ANTHROPIC_MODEL` — default `claude-haiku-4-5` (cheap, ~fractions of a cent per message). Set `claude-opus-4-8` if parsing ever feels off.
 - `TIMEZONE` — default `Asia/Singapore`

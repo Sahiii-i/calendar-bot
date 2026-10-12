@@ -1,6 +1,7 @@
 // One-time local script: authorizes your Google account and prints the
 // GOOGLE_REFRESH_TOKEN to put in .env. Run: npm run get-token
 import "dotenv/config";
+import fs from "fs";
 import http from "http";
 import { google } from "googleapis";
 
@@ -14,7 +15,8 @@ if (!clientId || !clientSecret) {
 const PORT = 53682;
 const REDIRECT = `http://127.0.0.1:${PORT}/callback`;
 const SCOPES = [
-  "https://www.googleapis.com/auth/calendar.events",
+  // Full calendar access: the bot creates its own School/Work/Personal/Deadlines calendars.
+  "https://www.googleapis.com/auth/calendar",
   "https://www.googleapis.com/auth/gmail.modify",
 ];
 
@@ -40,8 +42,15 @@ const server = http.createServer(async (req, res) => {
   try {
     const { tokens } = await oauth2.getToken(code);
     res.end("Done! Go back to the terminal.");
-    console.log("\n✅ Success. Add this line to your .env:\n");
-    console.log(`GOOGLE_REFRESH_TOKEN=${tokens.refresh_token}\n`);
+    // Written straight into .env, never printed, so the token can't end up
+    // in a terminal log or a chat transcript.
+    const env = fs.existsSync(".env") ? fs.readFileSync(".env", "utf8") : "";
+    const line = `GOOGLE_REFRESH_TOKEN=${tokens.refresh_token}`;
+    const next = /^GOOGLE_REFRESH_TOKEN=.*$/m.test(env)
+      ? env.replace(/^GOOGLE_REFRESH_TOKEN=.*$/m, line)
+      : `${env.trimEnd()}\n${line}\n`;
+    fs.writeFileSync(".env", next);
+    console.log("\n✅ Success. New GOOGLE_REFRESH_TOKEN saved into .env (not shown here).\n");
   } catch (err) {
     res.end("Token exchange failed, see terminal.");
     console.error(err);

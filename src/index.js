@@ -1,14 +1,29 @@
 import { Bot, InlineKeyboard } from "grammy";
 import cron from "node-cron";
 import { config } from "./config.js";
-import { interpretMessage, extractEventFromEmail } from "./ai.js";
-import { listEvents, createEvent, patchEvent, deleteEvent, listUnprocessedEmails, getEmail, markEmailProcessed } from "./google.js";
-import { dayRange, dayStart, fmtDate, fmtTime, fmtDateTime } from "./time.js";
+import { interpretMessage, extractFromEmail, summariseInbox } from "./ai.js";
+import {
+  CATEGORIES,
+  ensureCalendars,
+  categoryOf,
+  isAllDay,
+  listEvents,
+  createEvent,
+  patchEvent,
+  deleteEvent,
+  listUnprocessedEmails,
+  listRecentEmailSummaries,
+  getEmail,
+  markEmailProcessed,
+} from "./google.js";
+import { dismissedList, addDismissed } from "./store.js";
+import { dayRange, dayStart, fmtDate, fmtTime, fmtDateTime, isUsableFutureDate, reconcileWithEvidence, nowLocalISO } from "./time.js";
 
 const bot = new Bot(config.telegramToken);
 
 // Pending confirmations (proposed actions waiting for a button tap).
-// Entries: { kind: "create", event } | { kind: "update", eventId, changes, body } | { kind: "delete", eventId, body }
+// Entries: { kind: "create", event, source? } | { kind: "update", calendarId, eventId, changes, body } | { kind: "delete", calendarId, eventId, body }
+// event.category is school | work | personal | deadline.
 // In-memory: if the bot restarts, tapping an old button asks you to resend.
 const pending = new Map();
 let pendingSeq = 0;
@@ -22,11 +37,6 @@ function stash(entry) {
 }
 
 // ---------- Duplicate detection (email proposals) ----------
-
-// Email proposals Sahi tapped "Ignore" on, so reminder emails about the same
-// event don't keep re-asking. In-memory: resets on redeploy, but the calendar
-// check below covers anything that was actually added.
-const dismissed = [];
 
 function titleWords(s) {
   return new Set((s ?? "").toLowerCase().split(/\W+/).filter((w) => w.length > 2));
@@ -52,7 +62,7 @@ function sameEvent(titleA, startA, titleB, startB) {
   return Math.abs(a - b) <= 3 * 24 * 3600 * 1000;
 }
 
-// A similar event already on the calendar around that date, or null.
+// A similar event already on any of the calendars around that date, or null.
 async function findOnCalendar(event) {
   const dayMs = 24 * 3600 * 1000;
   const day = new Date(`${event.start.slice(0, 10)}T00:00:00+08:00`);
@@ -60,22 +70,32 @@ async function findOnCalendar(event) {
   return existing.find((e) => similarTitles(event.title, e.summary)) ?? null;
 }
 
-// Already waiting on a tap for this event, or previously ignored?
+// Already waiting on a tap for this, or previously turned down?
+// Turned-down items are stored on disk, so a redeploy doesn't bring them back.
 function alreadyAsked(event) {
   for (const entry of pending.values()) {
     if (entry.kind === "create" && entry.source === "email" && sameEvent(event.title, event.start, entry.event.title, entry.event.start)) return true;
   }
-  return dismissed.some((d) => sameEvent(event.title, event.start, d.title, d.start));
+  return dismissedList().some((d) => sameEvent(event.title, event.start, d.title, d.start));
+}
+
+// The model must quote the email for the date it found. If the quote isn't
+// actually in the email, say so on the card rather than hiding it.
+function evidenceInEmail(evidence, body) {
+  const norm = (s) => (s ?? "").toLowerCase().replace(/\s+/g, " ").trim();
+  return evidence && norm(body).includes(norm(evidence));
 }
 
 // ---------- Helpers ----------
 
 function eventLine(e) {
-  if (e.start?.date) return `• All day — ${e.summary ?? "(no title)"}`;
+  const cat = categoryOf(e.calendarId);
+  const dot = cat ? `${CATEGORIES[cat].emoji} ` : "";
+  if (e.start?.date) return `• ${dot}All day — ${e.summary ?? "(no title)"}`;
   const start = new Date(e.start.dateTime);
   const end = new Date(e.end.dateTime);
   const loc = e.location ? `\n   📍 ${e.location}` : "";
-  return `• ${fmtTime(start)}–${fmtTime(end)} — ${e.summary ?? "(no title)"}${loc}`;
+  return `• ${dot}${fmtTime(start)}–${fmtTime(end)} — ${e.summary ?? "(no title)"}${loc}`;
 }
 
 async function scheduleText(start, end, heading) {
@@ -94,13 +114,26 @@ async function scheduleText(start, end, heading) {
   return `${heading}\n\n${blocks.join("\n\n")}`;
 }
 
+function categoryLabel(category) {
+  const cat = CATEGORIES[category] ?? CATEGORIES.personal;
+  return `${cat.emoji} ${cat.name}`;
+}
+
 function describeProposal(event) {
-  const allDay = /^\d{4}-\d{2}-\d{2}$/.test(event.start);
-  const when = allDay
-    ? `${fmtDate(new Date(`${event.start}T00:00:00+08:00`))} (all day)`
-    : `${fmtDateTime(new Date(event.start))}${event.end ? ` → ${fmtTime(new Date(event.end))}` : ""}`;
+  const allDay = isAllDay(event.start);
+  const deadline = event.category === "deadline";
+  let when;
+  if (deadline) {
+    when = allDay
+      ? `Due ${fmtDate(new Date(`${event.start}T00:00:00+08:00`))}`
+      : `Due ${fmtDateTime(new Date(event.start))}`;
+  } else {
+    when = allDay
+      ? `${fmtDate(new Date(`${event.start}T00:00:00+08:00`))} (all day)`
+      : `${fmtDateTime(new Date(event.start))}${event.end ? ` → ${fmtTime(new Date(event.end))}` : ""}`;
+  }
   const loc = event.location ? `\n📍 ${event.location}` : "";
-  return `📌 ${event.title}\n🕐 ${when}${loc}`;
+  return `📌 ${event.title}\n🕐 ${when}${loc}\n${categoryLabel(event.category)}`;
 }
 
 // When/where line for an existing Google Calendar event.
@@ -126,7 +159,7 @@ function buildChanges(parsed, ev) {
     changes.start = parsed.new_start;
     if (parsed.new_end) {
       changes.end = parsed.new_end;
-    } else if (ev.start?.dateTime && ev.end?.dateTime && !/^\d{4}-\d{2}-\d{2}$/.test(parsed.new_start)) {
+    } else if (ev.start?.dateTime && ev.end?.dateTime && !isAllDay(parsed.new_start)) {
       const duration = new Date(ev.end.dateTime) - new Date(ev.start.dateTime);
       changes.end = new Date(new Date(parsed.new_start).getTime() + duration).toISOString();
     }
@@ -140,8 +173,7 @@ function describeChanges(ev, changes) {
   const after = [];
   if (changes.title) after.push(`📌 ${changes.title}`);
   if (changes.start) {
-    const allDay = /^\d{4}-\d{2}-\d{2}$/.test(changes.start);
-    after.push(`🕐 ${allDay
+    after.push(`🕐 ${isAllDay(changes.start)
       ? `${fmtDate(new Date(`${changes.start}T00:00:00+08:00`))} (all day)`
       : `${fmtDateTime(new Date(changes.start))}${changes.end ? `–${fmtTime(new Date(changes.end))}` : ""}`}`);
   } else if (changes.end) {
@@ -151,15 +183,31 @@ function describeChanges(ev, changes) {
   return `📌 ${ev.summary ?? "(no title)"}\n🕐 ${eventWhen(ev)}\n\n⬇️ becomes\n\n${after.join("\n")}`;
 }
 
+// The text of a proposal card. Email proposals keep their email context.
 function actionPrompt(entry) {
-  if (entry.kind === "create") return `Add this?\n\n${describeProposal(entry.event)}`;
+  if (entry.kind === "create") {
+    const head = entry.header ?? "Add this?";
+    const tail = entry.footer ? `\n\n${entry.footer}` : "";
+    return `${head}\n\n${describeProposal(entry.event)}${tail}`;
+  }
   if (entry.kind === "delete") return `Delete this? 🗑\n\n${entry.body}`;
   return `Update this?\n\n${entry.body}`;
 }
 
+// Confirm/cancel buttons. Non-deadline proposals also get a row to switch
+// the category before adding, so a wrong guess is one tap to fix.
 function confirmKeyboard(id, entry) {
   const yes = { create: "✅ Add", update: "✅ Update", delete: "🗑 Delete" }[entry.kind];
-  return new InlineKeyboard().text(yes, `confirm:${id}`).text("❌ Cancel", `cancel:${id}`);
+  const no = entry.kind === "create" && entry.source === "email" ? "❌ Not needed" : "❌ Cancel";
+  const kb = new InlineKeyboard().text(yes, `confirm:${id}`).text(no, `cancel:${id}`);
+  if (entry.kind === "create" && entry.event.category !== "deadline") {
+    kb.row();
+    for (const key of ["school", "work", "personal"]) {
+      if (key === entry.event.category) continue;
+      kb.text(`→ ${CATEGORIES[key].emoji} ${CATEGORIES[key].name}`, `cat:${id}:${key}`);
+    }
+  }
+  return kb;
 }
 
 function isAuthorized(ctx) {
@@ -175,11 +223,14 @@ bot.command("start", async (ctx) => {
       "Hey! I'm your calendar assistant. 🗓",
       "",
       "• Type things like \"Zoom with Benson tomorrow 3pm to 4pm\" and I'll add them to Google Calendar (I'll confirm first).",
-      "• Move or cancel things too: \"push tomorrow's Zoom to 12.30pm\", \"cancel Friday's dentist\".",
+      "• Deadlines too: \"pay hostel fee by 22 Oct noon\".",
+      "• Move or cancel things: \"push tomorrow's Zoom to 12.30pm\", \"cancel Friday's dentist\".",
       "• Ask \"what's on this Friday?\" to check your schedule.",
-      "• /today and /tomorrow for quick views, /week for the next 7 days.",
-      `• Every night at ${String(config.digestHour).padStart(2, "0")}:${String(config.digestMinute).padStart(2, "0")} I send tomorrow's schedule.`,
-      "• I also watch your Gmail for interview/meeting emails and propose adding them.",
+      "• /today and /tomorrow for quick views, /week for the next 7 days, /briefing for today's inbox recap.",
+      `• Every night at ${String(config.digestHour).padStart(2, "0")}:${String(config.digestMinute).padStart(2, "0")} I send what happened in your inbox today and tomorrow's schedule.`,
+      "• I watch your Gmail for appointments and deadlines and ask before adding them.",
+      "",
+      `Colours: ${Object.values(CATEGORIES).map((c) => `${c.emoji} ${c.name}`).join("  ")}`,
       "",
       `Your chat id: ${ctx.chat.id}${config.telegramChatId ? "" : "  ← put this in TELEGRAM_CHAT_ID"}`,
     ].join("\n"),
@@ -204,6 +255,11 @@ bot.command("week", async (ctx) => {
   await ctx.reply(await scheduleText(start, end, "📅 Next 7 days"));
 });
 
+bot.command("briefing", async (ctx) => {
+  if (!isAuthorized(ctx)) return;
+  await ctx.reply(await inboxBriefingText());
+});
+
 // ---------- Free-text messages ----------
 
 bot.on("message:text", async (ctx) => {
@@ -218,8 +274,9 @@ bot.on("message:text", async (ctx) => {
       const event = {
         title: parsed.title,
         start: parsed.start,
-        end: parsed.end || "",
+        end: parsed.is_deadline ? "" : parsed.end || "",
         location: parsed.location || "",
+        category: parsed.is_deadline ? "deadline" : parsed.category || "personal",
       };
       const entry = { kind: "create", event };
       const id = stash(entry);
@@ -261,9 +318,9 @@ bot.on("message:text", async (ctx) => {
       }
 
       const toEntry = (ev) => {
-        if (!isUpdate) return { kind: "delete", eventId: ev.id, body: `📌 ${ev.summary ?? "(no title)"}\n🕐 ${eventWhen(ev)}` };
+        if (!isUpdate) return { kind: "delete", calendarId: ev.calendarId, eventId: ev.id, body: `📌 ${ev.summary ?? "(no title)"}\n🕐 ${eventWhen(ev)}` };
         const changes = buildChanges(parsed, ev);
-        return { kind: "update", eventId: ev.id, changes, body: describeChanges(ev, changes) };
+        return { kind: "update", calendarId: ev.calendarId, eventId: ev.id, changes, body: describeChanges(ev, changes) };
       };
 
       if (candidates.length === 1) {
@@ -293,7 +350,7 @@ bot.on("message:text", async (ctx) => {
   }
 });
 
-// ---------- Confirmation buttons ----------
+// ---------- Buttons ----------
 
 // Ambiguity picker: user tapped which event they meant — show its confirm prompt.
 bot.callbackQuery(/^pick:(.+)$/, async (ctx) => {
@@ -306,6 +363,21 @@ bot.callbackQuery(/^pick:(.+)$/, async (ctx) => {
     return;
   }
   await ctx.answerCallbackQuery();
+  await ctx.editMessageText(actionPrompt(entry), { reply_markup: confirmKeyboard(id, entry) });
+});
+
+// Category switch on a proposal: re-draw the same card with the new colour.
+bot.callbackQuery(/^cat:([^:]+):(school|work|personal)$/, async (ctx) => {
+  if (!isAuthorized(ctx)) return;
+  const [, id, category] = ctx.match;
+  const entry = pending.get(id);
+  if (!entry || entry.kind !== "create") {
+    await ctx.answerCallbackQuery({ text: "This one expired. Send it again." });
+    await ctx.editMessageReplyMarkup();
+    return;
+  }
+  entry.event.category = category;
+  await ctx.answerCallbackQuery({ text: `Now ${CATEGORIES[category].name}` });
   await ctx.editMessageText(actionPrompt(entry), { reply_markup: confirmKeyboard(id, entry) });
 });
 
@@ -322,10 +394,9 @@ bot.callbackQuery(/^(confirm|cancel):(.+)$/, async (ctx) => {
 
   if (action === "cancel") {
     if (entry.kind === "create" && entry.source === "email") {
-      dismissed.push({ title: entry.event.title, start: entry.event.start });
-      if (dismissed.length > 100) dismissed.shift();
-      await ctx.answerCallbackQuery({ text: "Ignored" });
-      await ctx.editMessageText("❌ Ignored. I won't ask about this event again.");
+      addDismissed({ title: entry.event.title, start: entry.event.start, kind: entry.event.category, undated: Boolean(entry.undated) });
+      await ctx.answerCallbackQuery({ text: "Got it" });
+      await ctx.editMessageText(`❌ Not needed. I won't ask about this again.\n\n📌 ${entry.event.title}`);
       return;
     }
     await ctx.answerCallbackQuery({ text: "Cancelled" });
@@ -345,14 +416,15 @@ bot.callbackQuery(/^(confirm|cancel):(.+)$/, async (ctx) => {
         }
       }
       const created = await createEvent(entry.event);
+      const reminder = entry.event.category === "deadline" ? "\n🔔 I'll remind you 3 days and 1 day before." : "";
       await ctx.answerCallbackQuery({ text: "Added!" });
-      await ctx.editMessageText(`✅ Added to calendar\n\n${describeProposal(entry.event)}\n\n${created.htmlLink ?? ""}`);
+      await ctx.editMessageText(`✅ Added to calendar\n\n${describeProposal(entry.event)}${reminder}\n\n${created.htmlLink ?? ""}`);
     } else if (entry.kind === "update") {
-      await patchEvent(entry.eventId, entry.changes);
+      await patchEvent(entry.calendarId, entry.eventId, entry.changes);
       await ctx.answerCallbackQuery({ text: "Updated!" });
       await ctx.editMessageText(`✅ Updated\n\n${entry.body}`);
     } else {
-      await deleteEvent(entry.eventId);
+      await deleteEvent(entry.calendarId, entry.eventId);
       await ctx.answerCallbackQuery({ text: "Deleted" });
       await ctx.editMessageText(`🗑 Deleted\n\n${entry.body}`);
     }
@@ -363,14 +435,33 @@ bot.callbackQuery(/^(confirm|cancel):(.+)$/, async (ctx) => {
   }
 });
 
-// ---------- Nightly digest ----------
+// ---------- Nightly briefing ----------
+
+// "What happened in your inbox today", grouped by area of life.
+async function inboxBriefingText() {
+  const emails = await listRecentEmailSummaries();
+  if (emails.length === 0) return "📬 Today in your inbox\n\nNo new email today.";
+  const { sections } = await summariseInbox(emails);
+  const icons = { School: "🎓", Work: "💼", Personal: "🏠", Money: "💳" };
+  const blocks = sections
+    .filter((s) => s.items.length > 0)
+    .map((s) => `${icons[s.heading] ?? "•"} ${s.heading}\n${s.items.map((i) => `• ${i}`).join("\n")}`);
+  if (blocks.length === 0) return `📬 Today in your inbox\n\n${emails.length} emails, nothing worth your time.`;
+  return `📬 Today in your inbox\n\n${blocks.join("\n\n")}`;
+}
 
 async function sendDigest() {
   if (!config.telegramChatId) return;
+  // Each half is sent even if the other fails, so a Gmail hiccup never
+  // costs you tomorrow's schedule.
+  try {
+    await bot.api.sendMessage(config.telegramChatId, await inboxBriefingText());
+  } catch (err) {
+    console.error("inbox briefing failed:", err);
+  }
   try {
     const { start, end } = dayRange(1);
-    const text = await scheduleText(start, end, `🌙 Tomorrow, ${fmtDate(start)}`);
-    await bot.api.sendMessage(config.telegramChatId, text);
+    await bot.api.sendMessage(config.telegramChatId, await scheduleText(start, end, `🌙 Tomorrow, ${fmtDate(start)}`));
   } catch (err) {
     console.error("digest failed:", err);
   }
@@ -384,6 +475,30 @@ cron.schedule(`${config.digestMinute} ${config.digestHour} * * *`, sendDigest, {
 
 let scanning = false;
 
+// A deadline the email gives no date for. Nothing to add to the calendar, so
+// the card asks for a date instead; "Not needed" stops it coming back.
+async function proposeUndatedDeadline(result, email) {
+  const today = nowLocalISO().slice(0, 10);
+  const marker = { title: result.title, start: today };
+  if (alreadyAskedUndated(result.title)) return;
+  const entry = { kind: "create", source: "email", undated: true, event: { ...marker, category: "deadline" } };
+  const pid = stash(entry);
+  const kb = new InlineKeyboard().text("❌ Not needed", `cancel:${pid}`);
+  await bot.api.sendMessage(
+    config.telegramChatId,
+    `⏰ Deadline in your email, no date given\nFrom: ${email.from}\nSubject: ${email.subject}\n\n📌 ${result.title}\n\nReply with a date to add it, e.g. "${result.title} by Friday".`,
+    { reply_markup: kb },
+  );
+}
+
+// Undated deadlines have no date to compare, so match on title alone.
+function alreadyAskedUndated(title) {
+  for (const entry of pending.values()) {
+    if (entry.undated && similarTitles(title, entry.event.title)) return true;
+  }
+  return dismissedList().some((d) => d.undated && similarTitles(title, d.title));
+}
+
 async function scanEmails() {
   if (scanning || !config.telegramChatId) return;
   scanning = true;
@@ -392,32 +507,58 @@ async function scanEmails() {
     for (const { id } of messages) {
       const email = await getEmail(id);
       try {
-        const result = await extractEventFromEmail(email);
-        if (result.has_event && result.title && result.start) {
-          const event = {
-            title: result.title,
-            start: result.start,
-            end: result.end || "",
-            location: result.location || "",
-            description: `From email: ${email.subject} (${email.from})`,
-          };
-          // Reminder emails repeat events that are already handled: skip
-          // anything already on the calendar, already awaiting a tap, or
-          // already ignored.
-          if ((await findOnCalendar(event)) || alreadyAsked(event)) {
-            console.log(`skipping duplicate email event: "${event.title}" (${email.subject})`);
-            continue;
-          }
-          const pid = stash({ kind: "create", event, source: "email" });
-          const keyboard = new InlineKeyboard()
-            .text("✅ Add", `confirm:${pid}`)
-            .text("❌ Ignore", `cancel:${pid}`);
-          await bot.api.sendMessage(
-            config.telegramChatId,
-            `📧 Found an appointment in your email\nFrom: ${email.from}\nSubject: ${email.subject}\n\n${describeProposal(event)}\n\nAdd it to your calendar?`,
-            { reply_markup: keyboard },
-          );
+        const result = await extractFromEmail(email);
+        if (result.kind === "none" || !result.title) continue;
+        const deadline = result.kind === "deadline";
+        // A deadline with no date still matters (e.g. "you have yet to complete
+        // your medical exam"): flag it so it isn't silently dropped.
+        if (deadline && !result.start) {
+          await proposeUndatedDeadline(result, email);
+          continue;
         }
+        // Dates come from the model, so check them before anything else, then
+        // hold them against the sentence the model quoted from the email.
+        if (isUsableFutureDate(result.start)) {
+          const checked = reconcileWithEvidence(result.start, result.evidence, { deadline });
+          result.start = checked.start;
+          result.checkNotes = checked.notes;
+        }
+        if (!isUsableFutureDate(result.start)) {
+          console.log(`skipping "${result.title}": unusable or past date "${result.start}" (${email.subject})`);
+          continue;
+        }
+        const event = {
+          title: result.title,
+          start: result.start,
+          end: deadline ? "" : result.end || "",
+          location: result.location || "",
+          category: deadline ? "deadline" : result.category,
+          description: `From email: ${email.subject} (${email.from})${result.evidence ? `\n\n"${result.evidence}"` : ""}`,
+        };
+        // Reminder emails repeat things already handled: skip anything already
+        // on the calendar, already awaiting a tap, or already turned down.
+        if ((await findOnCalendar(event)) || alreadyAsked(event)) {
+          console.log(`skipping duplicate: "${event.title}" (${email.subject})`);
+          continue;
+        }
+        const quoteLines = [];
+        if (result.evidence) {
+          quoteLines.push(`🔎 "${result.evidence}"`);
+          if (!evidenceInEmail(result.evidence, email.body)) quoteLines.push("⚠️ I couldn't find that exact wording in the email, check the date.");
+        }
+        quoteLines.push(...(result.checkNotes ?? []));
+        const quote = quoteLines.join("\n");
+        const entry = {
+          kind: "create",
+          source: "email",
+          event,
+          header: `${deadline ? "⏰ Deadline in your email" : "📧 Appointment in your email"}\nFrom: ${email.from}\nSubject: ${email.subject}`,
+          footer: quote,
+        };
+        const pid = stash(entry);
+        await bot.api.sendMessage(config.telegramChatId, actionPrompt(entry), { reply_markup: confirmKeyboard(pid, entry) });
+      } catch (err) {
+        console.error(`email ${id} failed:`, err);
       } finally {
         // Mark processed either way so the same email isn't re-scanned.
         await markEmailProcessed(id);
@@ -435,6 +576,15 @@ setInterval(scanEmails, config.emailPollMinutes * 60 * 1000);
 // ---------- Boot ----------
 
 bot.catch((err) => console.error("bot error:", err));
+
+try {
+  const ids = await ensureCalendars();
+  console.log(`calendars ready: ${Object.keys(ids).join(", ")}`);
+} catch (err) {
+  // Most likely the Google token predates the calendar permission. Events
+  // still work, they just land on the primary calendar without colours.
+  console.error("could not set up category calendars, using primary:", err.message);
+}
 
 bot.start({
   onStart: (me) => {

@@ -6,7 +6,8 @@
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
-    "get-token": "node scripts/get-google-token.js"
+    "get-token": "node scripts/get-google-token.js",
+    "test": "node --test test/"
   },
   "engines": {
     "node": ">=18"
