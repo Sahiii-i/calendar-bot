@@ -233,3 +233,81 @@ export function upcomingDaysTable(today = todayLocalYMD()) {
   }
   return rows.join("; ");
 }
+
+// ---------- Repeating events ----------
+// The model says how an event repeats in fields; the RRULE is written here so
+// a wrong date maths never reaches Google Calendar.
+
+const RRULE_DAYS = ["SU", "MO", "TU", "WE", "TH", "FR", "SA"];
+const DAY_NAMES = { MO: "Mon", TU: "Tue", WE: "Wed", TH: "Thu", FR: "Fri", SA: "Sat", SU: "Sun" };
+
+export function isRepeating(repeat) {
+  return Boolean(repeat && repeat.freq && repeat.freq !== "none");
+}
+
+// For a weekly repeat on set days, the first occurrence must be one of those
+// days (Google always shows the start itself). Moves start forward if needed.
+export function alignToWeekdays(start, repeat) {
+  if (!isRepeating(repeat) || repeat.freq !== "weekly" || !repeat.weekdays?.length) return start;
+  const ymd = start.slice(0, 10);
+  for (let i = 0; i < 7; i++) {
+    const d = addDays(ymd, i);
+    if (repeat.weekdays.includes(RRULE_DAYS[weekdayOf(d)])) return onDay(start, d);
+  }
+  return start;
+}
+
+// "RRULE:..." for Google Calendar, or null for a one-off event.
+export function buildRRule(repeat, start) {
+  if (!isRepeating(repeat)) return null;
+  const ymd = start.slice(0, 10);
+  const parts = [`FREQ=${repeat.freq.toUpperCase()}`];
+  if (repeat.interval > 1) parts.push(`INTERVAL=${repeat.interval}`);
+  if (repeat.freq === "weekly" && repeat.weekdays?.length) {
+    parts.push(`BYDAY=${RRULE_DAYS.filter((d) => repeat.weekdays.includes(d)).join(",")}`);
+  }
+  if (repeat.freq === "monthly") {
+    const day = Number(ymd.slice(8, 10));
+    if (repeat.monthly_by === "nth_weekday" || repeat.monthly_by === "last_weekday") {
+      const nth = repeat.monthly_by === "last_weekday" || day > 28 ? -1 : Math.ceil(day / 7);
+      parts.push(`BYDAY=${nth}${RRULE_DAYS[weekdayOf(ymd)]}`);
+    } else {
+      parts.push(`BYMONTHDAY=${day}`);
+    }
+  }
+  if (repeat.count > 0) {
+    parts.push(`COUNT=${repeat.count}`);
+  } else if (/^\d{4}-\d{2}-\d{2}$/.test(repeat.until ?? "")) {
+    const u = repeat.until.replace(/-/g, "");
+    // Timed events need UNTIL in UTC: 23:59:59 Singapore time is 15:59:59Z.
+    parts.push(`UNTIL=${start.length === 10 ? u : `${u}T155959Z`}`);
+  }
+  return `RRULE:${parts.join(";")}`;
+}
+
+const ORDINALS = { 1: "1st", 2: "2nd", 3: "3rd", "-1": "last" };
+
+// "Every week on Mon, Wed until 30 Nov" for the confirm card.
+export function describeRepeat(repeat, start) {
+  if (!isRepeating(repeat)) return "";
+  const ymd = start.slice(0, 10);
+  const n = repeat.interval > 1 ? repeat.interval : 1;
+  const unit = { daily: "day", weekly: "week", monthly: "month", yearly: "year" }[repeat.freq];
+  let text = n > 1 ? `Every ${n} ${unit}s` : `Every ${unit}`;
+  if (repeat.freq === "weekly") {
+    const days = repeat.weekdays?.length ? repeat.weekdays : [RRULE_DAYS[weekdayOf(ymd)]];
+    text += ` on ${RRULE_DAYS.filter((d) => days.includes(d)).map((d) => DAY_NAMES[d]).join(", ")}`;
+  }
+  if (repeat.freq === "monthly") {
+    const day = Number(ymd.slice(8, 10));
+    if (repeat.monthly_by === "nth_weekday" || repeat.monthly_by === "last_weekday") {
+      const nth = repeat.monthly_by === "last_weekday" || day > 28 ? -1 : Math.ceil(day / 7);
+      text += ` on the ${ORDINALS[nth] ?? `${nth}th`} ${DAY_NAMES[RRULE_DAYS[weekdayOf(ymd)]]}`;
+    } else {
+      text += ` on the ${day}${[11, 12, 13].includes(day) ? "th" : ({ 1: "st", 2: "nd", 3: "rd" }[day % 10] ?? "th")}`;
+    }
+  }
+  if (repeat.count > 0) text += `, ${repeat.count} times`;
+  else if (repeat.until) text += ` until ${fmtDate(new Date(`${repeat.until}T12:00:00${TZ_OFFSET}`))}`;
+  return text;
+}

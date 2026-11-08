@@ -16,7 +16,7 @@ export const config = {
   // the bot /start and it replies with the id to put here.
   telegramChatId: process.env.TELEGRAM_CHAT_ID || "",
   anthropicApiKey: required("ANTHROPIC_API_KEY"),
-  anthropicModel: process.env.ANTHROPIC_MODEL || "claude-haiku-4-5",
+  anthropicModel: process.env.ANTHROPIC_MODEL || "claude-haiku-5-5",
   google: {
     clientId: required("GOOGLE_CLIENT_ID"),
     clientSecret: required("GOOGLE_CLIENT_SECRET"),

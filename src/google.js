@@ -95,7 +95,8 @@ function deadlineReminders(allDay) {
   return { useDefault: false, overrides: minutes.map((m) => ({ method: "popup", minutes: m })) };
 }
 
-// event: { title, start, end, location, description, category }
+// event: { title, start, end, location, description, category, recurrence? }
+// recurrence is a list like ["RRULE:FREQ=WEEKLY;BYDAY=MO"], built in time.js.
 // start/end are ISO datetimes, or YYYY-MM-DD for all-day.
 // A deadline with a time is a 30 minute block ending at the due time.
 export async function createEvent(event) {
@@ -114,6 +115,7 @@ export async function createEvent(event) {
     start: allDay ? { date: start } : { dateTime: start, timeZone: config.timezone },
     end: allDay ? { date: nextDay(start) } : { dateTime: end, timeZone: config.timezone },
     reminders: deadline ? deadlineReminders(allDay) : undefined,
+    recurrence: event.recurrence?.length ? event.recurrence : undefined,
   };
   const calendarId = calendarIdFor(event.category);
   const res = await calendar.events.insert({ calendarId, requestBody });

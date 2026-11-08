@@ -1,7 +1,7 @@
 import { Bot, InlineKeyboard } from "grammy";
 import cron from "node-cron";
 import { config } from "./config.js";
-import { interpretMessage, extractFromEmail, summariseInbox } from "./ai.js";
+import { interpretMessage, extractFromEmail, summariseInbox, readScreenshot } from "./ai.js";
 import {
   CATEGORIES,
   ensureCalendars,
@@ -17,7 +17,7 @@ import {
   markEmailProcessed,
 } from "./google.js";
 import { dismissedList, addDismissed } from "./store.js";
-import { dayRange, dayStart, fmtDate, fmtTime, fmtDateTime, isUsableFutureDate, reconcileWithEvidence, nowLocalISO, resolveDayWord, onDay } from "./time.js";
+import { dayRange, dayStart, fmtDate, fmtTime, fmtDateTime, isUsableFutureDate, reconcileWithEvidence, nowLocalISO, resolveDayWord, onDay, isRepeating, alignToWeekdays, buildRRule, describeRepeat } from "./time.js";
 
 const bot = new Bot(config.telegramToken);
 
@@ -133,7 +133,8 @@ function describeProposal(event) {
       : `${fmtDateTime(new Date(event.start))}${event.end ? ` → ${fmtTime(new Date(event.end))}` : ""}`;
   }
   const loc = event.location ? `\n📍 ${event.location}` : "";
-  return `📌 ${event.title}\n🕐 ${when}${loc}\n${categoryLabel(event.category)}`;
+  const rep = event.repeatText ? `\n🔁 ${event.repeatText}` : "";
+  return `📌 ${event.title}\n🕐 ${when}${rep}${loc}\n${categoryLabel(event.category)}`;
 }
 
 // When/where line for an existing Google Calendar event.
@@ -226,6 +227,8 @@ bot.command("start", async (ctx) => {
       "• Deadlines too: \"pay hostel fee by 22 Oct noon\".",
       "• Move or cancel things: \"push tomorrow's Zoom to 12.30pm\", \"cancel Friday's dentist\".",
       "• Ask \"what's on this Friday?\" to check your schedule.",
+      "• Repeats: \"gym every Mon and Wed 7am\", \"send invoice to Mingyue every month on the 3rd\".",
+      "• Send a screenshot (a WhatsApp invite, a confirmation) and I'll pull the meeting out of it.",
       "• /today and /tomorrow for quick views, /week for the next 7 days, /briefing for today's inbox recap.",
       `• Every night at ${String(config.digestHour).padStart(2, "0")}:${String(config.digestMinute).padStart(2, "0")} I send what happened in your inbox today and tomorrow's schedule.`,
       "• I watch your Gmail for appointments and deadlines and ask before adding them.",
@@ -329,6 +332,15 @@ bot.on("message:text", async (ctx) => {
         location: parsed.location || "",
         category: parsed.is_deadline ? "deadline" : parsed.category || "personal",
       };
+      if (isRepeating(parsed.repeat)) {
+        const aligned = alignToWeekdays(event.start, parsed.repeat);
+        if (aligned !== event.start && event.end) {
+          event.end = onDay(event.end, aligned.slice(0, 10));
+        }
+        event.start = aligned;
+        event.recurrence = [buildRRule(parsed.repeat, event.start)];
+        event.repeatText = describeRepeat(parsed.repeat, event.start);
+      }
       const entry = { kind: "create", event };
       const id = stash(entry);
       await ctx.reply(actionPrompt(entry), { reply_markup: confirmKeyboard(id, entry) });
@@ -414,6 +426,61 @@ bot.on("message:text", async (ctx) => {
     console.error("message handling failed:", err);
     await ctx.reply("Something went wrong reading that. Try rephrasing with a clear date and time.");
   }
+});
+
+// ---------- Screenshots ----------
+
+// A photo, or an image sent as a file, is read for appointments and
+// deadlines. Each one found becomes its own card; nothing is added untapped.
+async function handleImage(ctx, mediaType) {
+  if (!isAuthorized(ctx)) return;
+  await ctx.replyWithChatAction("typing");
+  try {
+    const file = await ctx.getFile();
+    if ((file.file_size ?? 0) > 5 * 1024 * 1024) {
+      await ctx.reply("That image is over 5 MB. Send it as a photo instead of a file.");
+      return;
+    }
+    const res = await fetch(`https://api.telegram.org/file/bot${config.telegramToken}/${file.file_path}`);
+    if (!res.ok) throw new Error(`Telegram file download ${res.status}`);
+    const data = Buffer.from(await res.arrayBuffer()).toString("base64");
+    const { events } = await readScreenshot(data, mediaType, ctx.message.caption ?? "");
+
+    const usable = events.filter((e) => e.title && isUsableFutureDate(e.start));
+    if (usable.length === 0) {
+      const past = events.length > 0 ? " Anything in it looks like it is already past." : "";
+      await ctx.reply(`I couldn't find a date to add in that screenshot.${past} Add a caption like "Wed 3pm" if it's there.`);
+      return;
+    }
+    for (const e of usable.slice(0, 5)) {
+      const deadline = e.is_deadline;
+      const event = {
+        title: e.title,
+        start: e.start,
+        end: deadline ? "" : e.end || "",
+        location: e.location || "",
+        category: deadline ? "deadline" : e.category || "personal",
+        description: e.evidence ? `From a screenshot: "${e.evidence}"` : "From a screenshot",
+      };
+      const notes = [];
+      if (e.evidence) notes.push(`🔎 "${e.evidence}"`);
+      if (e.date_basis === "relative_to_today") notes.push("⚠️ The screenshot shows no date, so I counted from today. Check the day.");
+      const entry = { kind: "create", event, header: "🖼 From your screenshot. Add this?", footer: notes.join("\n") };
+      const id = stash(entry);
+      await ctx.reply(actionPrompt(entry), { reply_markup: confirmKeyboard(id, entry) });
+    }
+  } catch (err) {
+    console.error("screenshot failed:", err);
+    await ctx.reply("I couldn't read that image. Try a clearer screenshot, or type the details.");
+  }
+}
+
+bot.on("message:photo", (ctx) => handleImage(ctx, "image/jpeg"));
+
+bot.on("message:document", async (ctx) => {
+  const type = ctx.message.document.mime_type ?? "";
+  if (!["image/jpeg", "image/png", "image/webp", "image/gif"].includes(type)) return;
+  await handleImage(ctx, type);
 });
 
 // ---------- Buttons ----------
