@@ -1,6 +1,6 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { config } from "./config.js";
-import { nowLocalISO } from "./time.js";
+import { nowLocalISO, upcomingDaysTable } from "./time.js";
 
 const client = new Anthropic({ apiKey: config.anthropicApiKey });
 
@@ -101,16 +101,23 @@ async function structured(system, userText, schema, maxTokens = 1024) {
 }
 
 // Interpret a free-text Telegram message from the user.
-export async function interpretMessage(text) {
+// `recent` is the event this chat last added or changed, so a follow-up like
+// "I said Wed not Thursday" can be read as a fix to it.
+export async function interpretMessage(text, recent = null) {
   const system = [
     "You turn a personal assistant user's chat message into structured calendar data.",
     ABOUT_USER,
     `Current date and time: ${nowLocalISO()} (${config.timezone}).`,
+    `Upcoming days, use this table for any weekday, never count yourself: ${upcomingDaysTable()}.`,
+    "A weekday on its own, or with 'this', 'next' or 'coming', means the first such day after today. 'Next week <day>' means that day in the following Monday-to-Sunday week.",
     "Resolve relative dates ('tomorrow', 'next Tuesday', 'later at 3') against that current time.",
     "Times the user gives are in that timezone. Never invent details the user did not state.",
     "'Change/move/reschedule/push X to ...' is update_event; 'cancel/delete/remove X' is delete_event.",
     "For updates like 'change it to 12.30pm tomorrow', the new time goes in new_start; leave query_start empty unless the user says when the event currently is.",
-  ].join(" ");
+    recent
+      ? `The event the user most recently added or changed in this chat: "${recent.title}" at ${recent.start}. A message correcting it ("I said Wed not Thursday", "make it 4pm", "wrong day") is update_event with target "${recent.title}" and the corrected new_start, keeping the same time unless the user gives a new one.`
+      : "",
+  ].filter(Boolean).join(" ");
   return structured(system, text, MESSAGE_SCHEMA);
 }
 

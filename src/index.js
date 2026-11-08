@@ -17,7 +17,7 @@ import {
   markEmailProcessed,
 } from "./google.js";
 import { dismissedList, addDismissed } from "./store.js";
-import { dayRange, dayStart, fmtDate, fmtTime, fmtDateTime, isUsableFutureDate, reconcileWithEvidence, nowLocalISO } from "./time.js";
+import { dayRange, dayStart, fmtDate, fmtTime, fmtDateTime, isUsableFutureDate, reconcileWithEvidence, nowLocalISO, resolveDayWord, onDay } from "./time.js";
 
 const bot = new Bot(config.telegramToken);
 
@@ -262,13 +262,64 @@ bot.command("briefing", async (ctx) => {
 
 // ---------- Free-text messages ----------
 
+// The event last added or changed from chat, so "I said Wed not Thursday"
+// right after has something to fix. Forgotten after a couple of hours.
+let recentEvent = null; // { calendarId, eventId, title, start, at }
+const RECENT_MS = 2 * 3600 * 1000;
+
+function rememberEvent(calendarId, eventId, title, start) {
+  recentEvent = { calendarId, eventId, title, start, at: Date.now() };
+}
+
+function currentRecent() {
+  return recentEvent && Date.now() - recentEvent.at < RECENT_MS ? recentEvent : null;
+}
+
+// The model is unreliable at weekday arithmetic, so when the message names a
+// single relative day ("next Thursday", "tmr"), code decides the date.
+// Returns a note for the card when the model's date had to be corrected.
+function pinToNamedDay(parsed, text) {
+  const day = resolveDayWord(text);
+  if (!day) return "";
+  let fixed = false;
+  const pin = (field) => {
+    if (parsed[field] && parsed[field].slice(0, 10) !== day) {
+      parsed[field] = onDay(parsed[field], day);
+      fixed = true;
+    }
+  };
+  if (parsed.intent === "create_event") {
+    // Shift the end by the same days, so overnight events keep their length.
+    if (parsed.start && parsed.end && parsed.start.slice(0, 10) !== day) {
+      const shift = new Date(`${day}T00:00:00Z`) - new Date(`${parsed.start.slice(0, 10)}T00:00:00Z`);
+      const endDay = new Date(new Date(`${parsed.end.slice(0, 10)}T00:00:00Z`).getTime() + shift).toISOString().slice(0, 10);
+      parsed.end = onDay(parsed.end, endDay);
+    }
+    pin("start");
+  } else if (parsed.intent === "update_event" && !parsed.query_start) {
+    pin("new_start");
+    if (parsed.new_end) pin("new_end");
+  } else if (parsed.intent === "query_schedule" && parsed.query_start) {
+    const oneDay = !parsed.query_end || new Date(parsed.query_end) - new Date(parsed.query_start) <= 24 * 3600 * 1000;
+    if (oneDay && parsed.query_start.slice(0, 10) !== day) {
+      parsed.query_start = `${day}T00:00:00+08:00`;
+      parsed.query_end = "";
+      fixed = true;
+    }
+  }
+  return fixed ? `date pinned to ${day}` : "";
+}
+
 bot.on("message:text", async (ctx) => {
   if (!isAuthorized(ctx)) return;
   const text = ctx.message.text;
   if (text.startsWith("/")) return;
 
   try {
-    const parsed = await interpretMessage(text);
+    const recent = currentRecent();
+    const parsed = await interpretMessage(text, recent ? { title: recent.title, start: recent.start } : null);
+    const dayNote = pinToNamedDay(parsed, text);
+    if (dayNote) console.log(`day corrected for "${text}": ${dayNote}`);
 
     if (parsed.intent === "create_event" && parsed.title && parsed.start) {
       const event = {
@@ -298,6 +349,26 @@ bot.on("message:text", async (ctx) => {
         return;
       }
 
+      const toEntry = (ev) => {
+        if (!isUpdate) return { kind: "delete", calendarId: ev.calendarId, eventId: ev.id, body: `📌 ${ev.summary ?? "(no title)"}\n🕐 ${eventWhen(ev)}` };
+        const changes = buildChanges(parsed, ev);
+        return { kind: "update", calendarId: ev.calendarId, eventId: ev.id, changes, body: describeChanges(ev, changes) };
+      };
+
+      // A fix to the event just added ("I said Wed not Thursday"): use it directly.
+      const recentNow = currentRecent();
+      if (recentNow && (!parsed.target || matchScore(parsed.target, recentNow.title) > 0) && !parsed.query_start) {
+        const at = new Date(isAllDay(recentNow.start) ? `${recentNow.start}T00:00:00+08:00` : recentNow.start).getTime();
+        const nearby = await listEvents(new Date(at - 3600 * 1000), new Date(at + 25 * 3600 * 1000));
+        const ev = nearby.find((e) => e.id === recentNow.eventId);
+        if (ev) {
+          const entry = toEntry(ev);
+          const id = stash(entry);
+          await ctx.reply(actionPrompt(entry), { reply_markup: confirmKeyboard(id, entry) });
+          return;
+        }
+      }
+
       // Search window: what the user indicated, else the next 14 days.
       const winStart = parsed.query_start ? new Date(parsed.query_start) : dayStart(0);
       const winEnd = parsed.query_end
@@ -317,11 +388,6 @@ bot.on("message:text", async (ctx) => {
         return;
       }
 
-      const toEntry = (ev) => {
-        if (!isUpdate) return { kind: "delete", calendarId: ev.calendarId, eventId: ev.id, body: `📌 ${ev.summary ?? "(no title)"}\n🕐 ${eventWhen(ev)}` };
-        const changes = buildChanges(parsed, ev);
-        return { kind: "update", calendarId: ev.calendarId, eventId: ev.id, changes, body: describeChanges(ev, changes) };
-      };
 
       if (candidates.length === 1) {
         const entry = toEntry(candidates[0]);
@@ -416,11 +482,13 @@ bot.callbackQuery(/^(confirm|cancel):(.+)$/, async (ctx) => {
         }
       }
       const created = await createEvent(entry.event);
+      if (entry.source !== "email") rememberEvent(created.calendarId, created.id, entry.event.title, entry.event.start);
       const reminder = entry.event.category === "deadline" ? "\n🔔 I'll remind you 3 days and 1 day before." : "";
       await ctx.answerCallbackQuery({ text: "Added!" });
       await ctx.editMessageText(`✅ Added to calendar\n\n${describeProposal(entry.event)}${reminder}\n\n${created.htmlLink ?? ""}`);
     } else if (entry.kind === "update") {
-      await patchEvent(entry.calendarId, entry.eventId, entry.changes);
+      const patched = await patchEvent(entry.calendarId, entry.eventId, entry.changes);
+      rememberEvent(entry.calendarId, entry.eventId, entry.changes.title ?? patched?.summary ?? recentEvent?.title ?? "", entry.changes.start ?? patched?.start?.dateTime ?? patched?.start?.date ?? "");
       await ctx.answerCallbackQuery({ text: "Updated!" });
       await ctx.editMessageText(`✅ Updated\n\n${entry.body}`);
     } else {

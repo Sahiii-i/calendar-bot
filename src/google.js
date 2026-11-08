@@ -115,8 +115,9 @@ export async function createEvent(event) {
     end: allDay ? { date: nextDay(start) } : { dateTime: end, timeZone: config.timezone },
     reminders: deadline ? deadlineReminders(allDay) : undefined,
   };
-  const res = await calendar.events.insert({ calendarId: calendarIdFor(event.category), requestBody });
-  return res.data;
+  const calendarId = calendarIdFor(event.category);
+  const res = await calendar.events.insert({ calendarId, requestBody });
+  return { ...res.data, calendarId };
 }
 
 // changes: { title?, start?, end?, location? } — only the fields being changed.

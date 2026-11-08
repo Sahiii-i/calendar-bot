@@ -136,3 +136,100 @@ export function reconcileWithEvidence(start, evidence, { deadline }) {
   }
   return { start: fixed, notes };
 }
+
+// ---------- Relative day words in the user's own message ----------
+// The model is bad at weekday arithmetic ("next Thursday" on a Saturday came
+// back as Friday). So the day the user named is worked out here, in code, and
+// the model's date is corrected to it.
+
+const WEEKDAYS = [
+  ["sun", "sunday"],
+  ["mon", "monday"],
+  ["tue", "tues", "tuesday"],
+  ["wed", "weds", "wednesday"],
+  ["thu", "thur", "thurs", "thursday"],
+  ["fri", "friday"],
+  ["sat", "saturday"],
+];
+const WD_ALT = WEEKDAYS.flat().sort((a, b) => b.length - a.length).join("|");
+
+function addDays(ymd, n) {
+  const d = new Date(`${ymd}T12:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + n);
+  return d.toISOString().slice(0, 10);
+}
+
+function weekdayOf(ymd) {
+  return new Date(`${ymd}T12:00:00Z`).getUTCDay();
+}
+
+function weekdayIndex(word) {
+  return WEEKDAYS.findIndex((names) => names.includes(word.toLowerCase()));
+}
+
+export function todayLocalYMD() {
+  return nowLocalISO().slice(0, 10);
+}
+
+// Does the text give an explicit calendar date ("6 Nov", "Nov 6", "6/11")?
+// Then the model has the date in front of it and the weekday word is not needed.
+function hasExplicitDate(text) {
+  const t = text.toLowerCase();
+  const mon = MONTHS.map((m) => `${m}|${m.slice(0, 3)}`).join("|");
+  return (
+    new RegExp(`\\b\\d{1,2}(st|nd|rd|th)?\\s+(of\\s+)?(${mon})\\b`).test(t) ||
+    new RegExp(`\\b(${mon})\\.?\\s+\\d{1,2}(st|nd|rd|th)?\\b`).test(t) ||
+    /\b\d{1,2}\/\d{1,2}\b/.test(t)
+  );
+}
+
+// The single calendar day the message names in relative words, or null when
+// it names none, names several, or gives an explicit date.
+// Rules (Sahi's usage):
+//   today / tonight -> today; tomorrow / tmr / tmrw -> +1; day after tomorrow -> +2
+//   "Thursday", "this Thursday", "next Thursday", "coming Thursday" -> the first
+//     Thursday after today ("this Thursday" on a Thursday is today)
+//   "next week Thursday", "Thursday next week" -> Thursday of next Mon-Sun week
+export function resolveDayWord(text, today = todayLocalYMD()) {
+  if (!text || hasExplicitDate(text)) return null;
+  const t = text.toLowerCase();
+  const found = new Set();
+
+  if (/\bday after (tomorrow|tmr|tmrw)\b/.test(t)) found.add(addDays(today, 2));
+  else if (/\b(tomorrow|tmr|tmrw|tml)\b/.test(t)) found.add(addDays(today, 1));
+  if (/\b(today|tonight)\b/.test(t)) found.add(today);
+
+  const re = new RegExp(`\\b(?:(next week)\\s+|(this|next|coming|the coming)\\s+)?(${WD_ALT})\\b(\\s+next week)?`, "g");
+  for (const m of t.matchAll(re)) {
+    const target = weekdayIndex(m[3]);
+    const now = weekdayOf(today);
+    if (m[1] || m[4]) {
+      // Monday of next week, then that weekday.
+      const toMonday = ((8 - now) % 7) || 7;
+      const monday = addDays(today, toMonday);
+      found.add(addDays(monday, (target + 6) % 7));
+    } else {
+      let ahead = (target - now + 7) % 7;
+      if (ahead === 0 && m[2] !== "this") ahead = 7;
+      found.add(addDays(today, ahead));
+    }
+  }
+  return found.size === 1 ? [...found][0] : null;
+}
+
+// Move an ISO date or datetime onto another calendar day, keeping its time.
+export function onDay(iso, ymd) {
+  if (!iso) return iso;
+  return ymd + iso.slice(10);
+}
+
+// A two-week lookup the model can read instead of counting weekdays.
+export function upcomingDaysTable(today = todayLocalYMD()) {
+  const names = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+  const rows = [];
+  for (let i = 0; i < 14; i++) {
+    const d = addDays(today, i);
+    rows.push(`${names[weekdayOf(d)]} ${d}${i === 0 ? " (today)" : i === 1 ? " (tomorrow)" : ""}`);
+  }
+  return rows.join("; ");
+}
